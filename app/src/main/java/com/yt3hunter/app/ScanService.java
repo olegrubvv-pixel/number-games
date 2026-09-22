@@ -3,6 +3,7 @@ package com.yt3hunter.app;
 import android.app.*;
 import android.content.*;
 import android.os.*;
+
 import java.io.*;
 import java.net.*;
 import java.nio.charset.StandardCharsets;
@@ -20,6 +21,13 @@ public class ScanService extends Service {
     private static final int NOTIF_ID=73;
     private static final String CHANNEL="yt3_scan";
 
+    private static final String[][] PROVIDERS={
+        {"YouTube","youtube","https://www.youtube.com/@"},
+        {"F5","f5","https://invidious.f5.si/api/v1/resolveurl?url="},
+        {"Nadeko","nadeko","https://inv.nadeko.net/api/v1/resolveurl?url="},
+        {"Tiekoetter","tie","https://invidious.tiekoetter.com/api/v1/resolveurl?url="}
+    };
+
     private volatile boolean scanning=false;
     private volatile boolean paused=false;
 
@@ -27,21 +35,19 @@ public class ScanService extends Service {
     private PowerManager.WakeLock wakeLock;
     private Db db;
     private SharedPreferences prefs;
-
     private List<String> handles;
+
     private final Object cursorLock=new Object();
     private AtomicInteger nextIndex;
     private int safeCursor;
     private final TreeSet<Integer> completed=new TreeSet<>();
+    private AtomicInteger processedCount=new AtomicInteger();
     private AtomicInteger takenCount=new AtomicInteger();
     private final AtomicInteger notificationTick=new AtomicInteger();
 
-    private static final String[][] PROVIDERS={
-        {"youtube","https://www.youtube.com/@"},
-        {"f5","https://invidious.f5.si/api/v1/resolveurl?url="},
-        {"nadeko","https://inv.nadeko.net/api/v1/resolveurl?url="},
-        {"tie","https://invidious.tiekoetter.com/api/v1/resolveurl?url="}
-    };
+    private final ExecutorService netPool=Executors.newFixedThreadPool(8);
+    private volatile List<Integer> activeProviders=Collections.emptyList();
+    private volatile long lastHealthCheck=0L;
 
     private static final ConcurrentHashMap<String,Gate> GATES=new ConcurrentHashMap<>();
 
@@ -53,12 +59,12 @@ public class ScanService extends Service {
         synchronized void before() throws InterruptedException {
             while(true){
                 long now=System.currentTimeMillis();
-                long ms=Math.max(backoffUntil-now,110-(now-lastStart));
-                if(ms<=0){
+                long wait=Math.max(backoffUntil-now,70-(now-lastStart));
+                if(wait<=0){
                     lastStart=now;
                     return;
                 }
-                wait(ms);
+                wait(wait);
             }
         }
 
@@ -70,9 +76,13 @@ public class ScanService extends Service {
 
         synchronized void failed(boolean hard){
             fail=Math.min(8,fail+(hard?2:1));
-            long ms=Math.min(hard?45000:15000,(long)(1000*Math.pow(1.65,fail)));
+            long ms=Math.min(hard?30000:12000,(long)(700*Math.pow(1.6,fail)));
             backoffUntil=Math.max(backoffUntil,System.currentTimeMillis()+ms);
             notifyAll();
+        }
+
+        synchronized boolean cooling(){
+            return backoffUntil>System.currentTimeMillis();
         }
     }
 
@@ -84,20 +94,31 @@ public class ScanService extends Service {
         final int type;
         final String reason;
 
-        Verdict(int t,String r){
-            type=t;
-            reason=r;
+        Verdict(int type,String reason){
+            this.type=type;
+            this.reason=reason;
+        }
+    }
+
+    static class ProviderVerdict {
+        final int providerIndex;
+        final Verdict verdict;
+
+        ProviderVerdict(int providerIndex,Verdict verdict){
+            this.providerIndex=providerIndex;
+            this.verdict=verdict;
         }
     }
 
     @Override public void onCreate(){
         super.onCreate();
+
         db=new Db(this);
         prefs=getSharedPreferences(PREFS,MODE_PRIVATE);
         createChannel();
 
-        for(String[] p:PROVIDERS){
-            GATES.putIfAbsent(p[0],new Gate());
+        for(String[] provider:PROVIDERS){
+            GATES.putIfAbsent(provider[1],new Gate());
         }
     }
 
@@ -128,11 +149,15 @@ public class ScanService extends Service {
 
         scanning=true;
         paused=prefs.getBoolean("paused",false);
-        prefs.edit().putBoolean("scanning",true).apply();
+
+        prefs.edit()
+            .putBoolean("scanning",true)
+            .apply();
 
         startForeground(NOTIF_ID,buildNotification("Запуск…"));
 
         if(!paused) acquireWake();
+
         startEngine();
 
         return START_STICKY;
@@ -158,21 +183,45 @@ public class ScanService extends Service {
                     return;
                 }
 
-                if("initial".equals(phase)){
-                    runInitial();
+                prefs.edit().putString("phase","health").apply();
+                refreshProviders(true);
+
+                if(activeProviders.size()<2){
+                    prefs.edit().putString("phase","waiting_sources").apply();
+                    updateNotification("Жду минимум 2 рабочих источника");
+
+                    while(scanning && activeProviders.size()<2){
+                        waitIfPaused();
+                        Thread.sleep(5000);
+                        refreshProviders(true);
+                    }
                 }
 
-                if(scanning){
+                if(!scanning) return;
+
+                if("retry".equals(phase)){
+                    prefs.edit().putString("phase","retry").apply();
                     runRetryLoop();
+                }else{
+                    prefs.edit().putString("phase","initial").apply();
+                    runInitial();
+
+                    if(scanning){
+                        runRetryLoop();
+                    }
                 }
 
                 return;
-            }catch(Throwable e){
-                prefs.edit().putString("last_error",String.valueOf(e)).apply();
-                updateNotification("Ошибка сети/движка — повтор через 15 сек");
+
+            }catch(Throwable error){
+                prefs.edit()
+                    .putString("last_error",String.valueOf(error))
+                    .apply();
+
+                updateNotification("Ошибка — повтор через 10 сек");
 
                 try{
-                    Thread.sleep(15000);
+                    Thread.sleep(10000);
                 }catch(InterruptedException ignored){
                     Thread.currentThread().interrupt();
                 }
@@ -180,34 +229,120 @@ public class ScanService extends Service {
         }
     }
 
+    private synchronized void refreshProviders(boolean force){
+        long now=System.currentTimeMillis();
+
+        if(!force && now-lastHealthCheck<30000) return;
+
+        lastHealthCheck=now;
+
+        ArrayList<Future<ProviderVerdict>> futures=new ArrayList<>();
+
+        for(int i=0;i<PROVIDERS.length;i++){
+            final int index=i;
+            futures.add(netPool.submit(
+                ()->new ProviderVerdict(index,checkProvider(index,"youtube"))
+            ));
+        }
+
+        ArrayList<Integer> good=new ArrayList<>();
+        ArrayList<String> names=new ArrayList<>();
+
+        for(Future<ProviderVerdict> future:futures){
+            try{
+                ProviderVerdict result=future.get(6,TimeUnit.SECONDS);
+
+                if(result.verdict.type==Verdict.TAKEN){
+                    good.add(result.providerIndex);
+                    names.add(PROVIDERS[result.providerIndex][0]);
+                }
+            }catch(Exception ignored){
+                future.cancel(true);
+            }
+        }
+
+        activeProviders=Collections.unmodifiableList(good);
+
+        prefs.edit()
+            .putInt("source_count",good.size())
+            .putString("sources",String.join(", ",names))
+            .apply();
+
+        updateNotification(
+            good.size()>=2
+                ? "Источники: "+good.size()+" • "+String.join(", ",names)
+                : "Рабочих источников: "+good.size()+"/2"
+        );
+    }
+
+    private List<Integer> providerSnapshot(){
+        if(System.currentTimeMillis()-lastHealthCheck>30000){
+            refreshProviders(false);
+        }
+
+        ArrayList<Integer> snapshot=new ArrayList<>();
+
+        for(int index:activeProviders){
+            Gate gate=GATES.get(PROVIDERS[index][1]);
+
+            if(gate!=null && !gate.cooling()){
+                snapshot.add(index);
+            }
+        }
+
+        if(snapshot.size()<2){
+            refreshProviders(true);
+            snapshot.clear();
+
+            for(int index:activeProviders){
+                Gate gate=GATES.get(PROVIDERS[index][1]);
+
+                if(gate!=null && !gate.cooling()){
+                    snapshot.add(index);
+                }
+            }
+        }
+
+        return snapshot;
+    }
+
     private void runInitial() throws InterruptedException {
         safeCursor=Math.min(prefs.getInt("cursor",0),handles.size());
         nextIndex=new AtomicInteger(safeCursor);
+        processedCount=new AtomicInteger(safeCursor);
         takenCount.set(prefs.getInt("taken",0));
         completed.clear();
 
         int workers=4;
-        ExecutorService pool=Executors.newFixedThreadPool(workers);
+
+        ExecutorService workersPool=Executors.newFixedThreadPool(workers);
         CountDownLatch latch=new CountDownLatch(workers);
 
         for(int w=0;w<workers;w++){
-            pool.execute(()->{
+            workersPool.execute(()->{
                 try{
                     while(scanning){
                         waitIfPaused();
 
-                        int idx=nextIndex.getAndIncrement();
-                        if(idx>=handles.size()) break;
+                        int index=nextIndex.getAndIncrement();
 
-                        String h=handles.get(idx);
-                        prefs.edit().putString("current",h).apply();
+                        if(index>=handles.size()) break;
 
-                        Verdict verdict=verifyStrict(h);
-                        applyInitial(h,verdict);
-                        markCompleted(idx);
+                        String handle=handles.get(index);
+
+                        prefs.edit()
+                            .putString("current",handle)
+                            .apply();
+
+                        Verdict verdict=verifyStrict(handle);
+
+                        applyInitial(handle,verdict);
+                        markCompleted(index);
                     }
+
                 }catch(InterruptedException e){
                     Thread.currentThread().interrupt();
+
                 }finally{
                     latch.countDown();
                 }
@@ -215,7 +350,7 @@ public class ScanService extends Service {
         }
 
         latch.await();
-        pool.shutdownNow();
+        workersPool.shutdownNow();
 
         if(!scanning) return;
 
@@ -228,9 +363,11 @@ public class ScanService extends Service {
         updateNotification("Первый проход завершён");
     }
 
-    private void markCompleted(int idx){
+    private void markCompleted(int index){
+        int processed=processedCount.incrementAndGet();
+
         synchronized(cursorLock){
-            completed.add(idx);
+            completed.add(index);
 
             while(completed.remove(safeCursor)){
                 safeCursor++;
@@ -238,11 +375,11 @@ public class ScanService extends Service {
 
             prefs.edit()
                 .putInt("cursor",safeCursor)
-                .putInt("checked",safeCursor)
+                .putInt("checked",processed)
                 .apply();
         }
 
-        if(notificationTick.incrementAndGet()%15==0){
+        if(notificationTick.incrementAndGet()%10==0){
             updateNotification(null);
         }
     }
@@ -251,7 +388,11 @@ public class ScanService extends Service {
         if(verdict.type==Verdict.TAKEN){
             takenCount.incrementAndGet();
             db.remove(handle);
-            prefs.edit().putInt("taken",takenCount.get()).apply();
+
+            prefs.edit()
+                .putInt("taken",takenCount.get())
+                .apply();
+
             return;
         }
 
@@ -269,6 +410,22 @@ public class ScanService extends Service {
         while(scanning){
             waitIfPaused();
 
+            refreshProviders(false);
+
+            if(activeProviders.size()<2){
+                prefs.edit().putString("phase","waiting_sources").apply();
+                updateNotification("Перепроверка ждёт 2 источника");
+
+                Thread.sleep(5000);
+                refreshProviders(true);
+
+                if(activeProviders.size()>=2){
+                    prefs.edit().putString("phase","retry").apply();
+                }
+
+                continue;
+            }
+
             List<String> pending=db.unknownHandles();
 
             if(pending.isEmpty()){
@@ -282,16 +439,24 @@ public class ScanService extends Service {
                 if(!scanning) return;
 
                 waitIfPaused();
-                prefs.edit().putString("current",handle).apply();
+
+                prefs.edit()
+                    .putString("current",handle)
+                    .apply();
 
                 Verdict verdict=verifyStrict(handle);
 
                 if(verdict.type==Verdict.TAKEN){
                     db.remove(handle);
                     takenCount.incrementAndGet();
-                    prefs.edit().putInt("taken",takenCount.get()).apply();
+
+                    prefs.edit()
+                        .putInt("taken",takenCount.get())
+                        .apply();
+
                 }else if(verdict.type==Verdict.FREE){
                     db.putFree(handle,verdict.reason);
+
                 }else{
                     db.putUnknown(handle,verdict.reason);
                 }
@@ -302,7 +467,7 @@ public class ScanService extends Service {
             }
 
             if(db.count(Db.UNKNOWN)>0){
-                Thread.sleep(30000);
+                Thread.sleep(15000);
             }
         }
     }
@@ -315,7 +480,8 @@ public class ScanService extends Service {
         }
 
         try{
-            Thread.sleep(650+new Random().nextInt(350));
+            Thread.sleep(500+new Random().nextInt(250));
+
         }catch(InterruptedException e){
             Thread.currentThread().interrupt();
             return new Verdict(Verdict.UNKNOWN,"interrupted");
@@ -324,53 +490,95 @@ public class ScanService extends Service {
         Verdict second=verifyPass(handle);
 
         if(second.type==Verdict.FREE){
-            return new Verdict(Verdict.FREE,first.reason+" | repeat ok");
+            return new Verdict(
+                Verdict.FREE,
+                first.reason+" | repeat ok"
+            );
         }
 
         if(second.type==Verdict.TAKEN){
             return second;
         }
 
-        return new Verdict(Verdict.UNKNOWN,"repeat: "+second.reason);
+        return new Verdict(
+            Verdict.UNKNOWN,
+            "repeat: "+second.reason
+        );
     }
 
     private Verdict verifyPass(String handle){
+        List<Integer> providers=providerSnapshot();
+
+        if(providers.size()<2){
+            return new Verdict(
+                Verdict.UNKNOWN,
+                "less than 2 working sources"
+            );
+        }
+
+        ArrayList<Future<ProviderVerdict>> futures=new ArrayList<>();
+
+        for(int providerIndex:providers){
+            futures.add(netPool.submit(
+                ()->new ProviderVerdict(
+                    providerIndex,
+                    checkProvider(providerIndex,handle)
+                )
+            ));
+        }
+
         ArrayList<String> freeBy=new ArrayList<>();
         ArrayList<String> unknownBy=new ArrayList<>();
 
-        Verdict youtube=checkYouTube(handle);
+        for(Future<ProviderVerdict> future:futures){
+            try{
+                ProviderVerdict result=future.get(6,TimeUnit.SECONDS);
+                String name=PROVIDERS[result.providerIndex][0];
 
-        if(youtube.type==Verdict.TAKEN){
-            return youtube;
-        }
+                if(result.verdict.type==Verdict.TAKEN){
+                    for(Future<ProviderVerdict> other:futures){
+                        if(other!=future) other.cancel(true);
+                    }
 
-        if(youtube.type==Verdict.FREE){
-            freeBy.add("YouTube");
-        }else{
-            unknownBy.add("YouTube:"+youtube.reason);
-        }
+                    return result.verdict;
+                }
 
-        for(int i=1;i<PROVIDERS.length;i++){
-            Verdict v=checkInvidious(PROVIDERS[i][0],PROVIDERS[i][1],handle);
+                if(result.verdict.type==Verdict.FREE){
+                    freeBy.add(name);
+                }else{
+                    unknownBy.add(
+                        name+":"+result.verdict.reason
+                    );
+                }
 
-            if(v.type==Verdict.TAKEN){
-                return v;
-            }
-
-            if(v.type==Verdict.FREE){
-                freeBy.add(PROVIDERS[i][0]);
-            }else{
-                unknownBy.add(PROVIDERS[i][0]+":"+v.reason);
+            }catch(Exception error){
+                future.cancel(true);
+                unknownBy.add("timeout");
             }
         }
 
         if(freeBy.size()>=2){
-            return new Verdict(Verdict.FREE,"free: "+String.join(",",freeBy));
+            return new Verdict(
+                Verdict.FREE,
+                "free: "+String.join(",",freeBy)
+            );
         }
 
         return new Verdict(
             Verdict.UNKNOWN,
             "need 2 confirmations; "+String.join(" | ",unknownBy)
+        );
+    }
+
+    private Verdict checkProvider(int providerIndex,String handle){
+        if(providerIndex==0){
+            return checkYouTube(handle);
+        }
+
+        return checkInvidious(
+            PROVIDERS[providerIndex][1],
+            PROVIDERS[providerIndex][2],
+            handle
         );
     }
 
@@ -381,20 +589,27 @@ public class ScanService extends Service {
             gate.before();
 
             String encoded=URLEncoder.encode(handle,"UTF-8");
-            URL url=new URL(PROVIDERS[0][1]+encoded+"?hl=en");
 
-            HttpURLConnection c=(HttpURLConnection)url.openConnection();
-            c.setConnectTimeout(9000);
-            c.setReadTimeout(9000);
-            c.setInstanceFollowRedirects(true);
-            c.setRequestProperty(
+            URL url=new URL(
+                PROVIDERS[0][2]+
+                encoded+
+                "?hl=en"
+            );
+
+            HttpURLConnection connection=(HttpURLConnection)url.openConnection();
+
+            connection.setConnectTimeout(4500);
+            connection.setReadTimeout(4500);
+            connection.setInstanceFollowRedirects(true);
+
+            connection.setRequestProperty(
                 "User-Agent",
                 "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/140 Mobile Safari/537.36"
             );
 
-            int code=c.getResponseCode();
-            String text=read(c,code);
-            String low=text.toLowerCase(Locale.ROOT);
+            int code=connection.getResponseCode();
+            String text=read(connection,code);
+            String lower=text.toLowerCase(Locale.ROOT);
 
             if(code==429){
                 gate.failed(true);
@@ -408,57 +623,101 @@ public class ScanService extends Service {
 
             if(code==404 || code==410){
                 gate.ok();
-                return new Verdict(Verdict.FREE,"YouTube "+code);
+                return new Verdict(
+                    Verdict.FREE,
+                    "YouTube "+code
+                );
             }
 
             if(
-                low.contains("\"channelid\":\"uc") ||
-                low.contains("\"externalid\":\"uc") ||
-                low.contains("\"browseid\":\"uc") ||
-                low.contains("youtube.com/channel/uc") ||
-                low.contains("\"canonicalbaseurl\":\"/@")
+                lower.contains("\"channelid\":\"uc") ||
+                lower.contains("\"externalid\":\"uc") ||
+                lower.contains("\"browseid\":\"uc") ||
+                lower.contains("youtube.com/channel/uc") ||
+                lower.contains("\"canonicalbaseurl\":\"/@")
             ){
                 gate.ok();
-                return new Verdict(Verdict.TAKEN,"YouTube channel metadata");
+
+                return new Verdict(
+                    Verdict.TAKEN,
+                    "YouTube channel metadata"
+                );
             }
 
             if(
-                low.contains("this page isn't available") ||
-                low.contains("this page isn’t available") ||
-                low.contains("this channel does not exist")
+                lower.contains("this page isn't available") ||
+                lower.contains("this page isn’t available") ||
+                lower.contains("this channel does not exist")
             ){
                 gate.ok();
-                return new Verdict(Verdict.FREE,"YouTube not found page");
+
+                return new Verdict(
+                    Verdict.FREE,
+                    "YouTube not found page"
+                );
             }
 
             gate.ok();
-            return new Verdict(Verdict.UNKNOWN,"ambiguous "+code);
+
+            return new Verdict(
+                Verdict.UNKNOWN,
+                "ambiguous "+code
+            );
+
+        }catch(InterruptedException e){
+            Thread.currentThread().interrupt();
+            return new Verdict(Verdict.UNKNOWN,"interrupted");
 
         }catch(Exception e){
             gate.failed(false);
-            return new Verdict(Verdict.UNKNOWN,e.getClass().getSimpleName());
+
+            return new Verdict(
+                Verdict.UNKNOWN,
+                e.getClass().getSimpleName()
+            );
         }
     }
 
-    private Verdict checkInvidious(String key,String base,String handle){
+    private Verdict checkInvidious(
+        String key,
+        String base,
+        String handle
+    ){
         Gate gate=GATES.get(key);
 
         try{
             gate.before();
 
-            String target="https://www.youtube.com/@"+handle;
-            String encoded=URLEncoder.encode(target,"UTF-8");
+            String target=
+                "https://www.youtube.com/@"+
+                handle;
+
+            String encoded=
+                URLEncoder.encode(
+                    target,
+                    "UTF-8"
+                );
+
             URL url=new URL(base+encoded);
 
-            HttpURLConnection c=(HttpURLConnection)url.openConnection();
-            c.setConnectTimeout(9000);
-            c.setReadTimeout(9000);
-            c.setRequestProperty("Accept","application/json");
+            HttpURLConnection connection=
+                (HttpURLConnection)url.openConnection();
 
-            int code=c.getResponseCode();
-            String text=read(c,code);
-            String low=text.toLowerCase(Locale.ROOT);
-            String compact=low.replace(" ","").replace("\n","").replace("\t","");
+            connection.setConnectTimeout(4500);
+            connection.setReadTimeout(4500);
+            connection.setRequestProperty(
+                "Accept",
+                "application/json"
+            );
+
+            int code=connection.getResponseCode();
+            String text=read(connection,code);
+            String lower=text.toLowerCase(Locale.ROOT);
+
+            String compact=lower
+                .replace(" ","")
+                .replace("\n","")
+                .replace("\t","");
 
             if(code==429){
                 gate.failed(true);
@@ -477,7 +736,11 @@ public class ScanService extends Service {
                 compact.contains("\"authorid\":\"uc")
             ){
                 gate.ok();
-                return new Verdict(Verdict.TAKEN,key+" resolved channel");
+
+                return new Verdict(
+                    Verdict.TAKEN,
+                    key+" resolved channel"
+                );
             }
 
             if(
@@ -485,51 +748,80 @@ public class ScanService extends Service {
                 (
                     code==400 &&
                     (
-                        low.contains("not found") ||
-                        low.contains("invalid") ||
-                        low.contains("could not resolve") ||
-                        low.contains("unable to resolve") ||
-                        low.contains("does not exist") ||
-                        low.contains("no matching")
+                        lower.contains("not found") ||
+                        lower.contains("invalid") ||
+                        lower.contains("could not resolve") ||
+                        lower.contains("unable to resolve") ||
+                        lower.contains("does not exist") ||
+                        lower.contains("no matching")
                     )
                 )
             ){
                 gate.ok();
-                return new Verdict(Verdict.FREE,key+" unresolved");
+
+                return new Verdict(
+                    Verdict.FREE,
+                    key+" unresolved"
+                );
             }
 
             gate.ok();
-            return new Verdict(Verdict.UNKNOWN,"http "+code);
+
+            return new Verdict(
+                Verdict.UNKNOWN,
+                "http "+code
+            );
+
+        }catch(InterruptedException e){
+            Thread.currentThread().interrupt();
+            return new Verdict(Verdict.UNKNOWN,"interrupted");
 
         }catch(Exception e){
             gate.failed(false);
-            return new Verdict(Verdict.UNKNOWN,e.getClass().getSimpleName());
+
+            return new Verdict(
+                Verdict.UNKNOWN,
+                e.getClass().getSimpleName()
+            );
         }
     }
 
-    private String read(HttpURLConnection c,int code) throws IOException {
-        InputStream in=code>=400?c.getErrorStream():c.getInputStream();
+    private String read(
+        HttpURLConnection connection,
+        int code
+    ) throws IOException {
+        InputStream input=
+            code>=400
+                ? connection.getErrorStream()
+                : connection.getInputStream();
 
-        if(in==null) return "";
+        if(input==null) return "";
 
-        ByteArrayOutputStream out=new ByteArrayOutputStream();
+        ByteArrayOutputStream output=
+            new ByteArrayOutputStream();
+
         byte[] buffer=new byte[8192];
         int n;
         int total=0;
 
-        while((n=in.read(buffer))>0 && total<1800000){
-            out.write(buffer,0,n);
+        while(
+            (n=input.read(buffer))>0 &&
+            total<1200000
+        ){
+            output.write(buffer,0,n);
             total+=n;
         }
 
-        in.close();
+        input.close();
 
-        return out.toString(StandardCharsets.UTF_8.name());
+        return output.toString(
+            StandardCharsets.UTF_8.name()
+        );
     }
 
     private void waitIfPaused() throws InterruptedException {
         while(scanning && paused){
-            Thread.sleep(500);
+            Thread.sleep(300);
         }
     }
 
@@ -546,8 +838,18 @@ public class ScanService extends Service {
 
         releaseWake();
 
-        NotificationManager nm=(NotificationManager)getSystemService(NOTIFICATION_SERVICE);
-        nm.notify(NOTIF_ID,buildNotification("Готово: вся очередь проверена, сомнительных 0"));
+        NotificationManager manager=
+            (NotificationManager)
+                getSystemService(
+                    NOTIFICATION_SERVICE
+                );
+
+        manager.notify(
+            NOTIF_ID,
+            buildNotification(
+                "Готово: вся очередь проверена, сомнительных 0"
+            )
+        );
 
         stopForeground(false);
         stopSelf();
@@ -568,10 +870,20 @@ public class ScanService extends Service {
     }
 
     private void acquireWake(){
-        if(wakeLock!=null && wakeLock.isHeld()) return;
+        if(
+            wakeLock!=null &&
+            wakeLock.isHeld()
+        ){
+            return;
+        }
 
-        PowerManager pm=(PowerManager)getSystemService(POWER_SERVICE);
-        wakeLock=pm.newWakeLock(
+        PowerManager manager=
+            (PowerManager)
+                getSystemService(
+                    POWER_SERVICE
+                );
+
+        wakeLock=manager.newWakeLock(
             PowerManager.PARTIAL_WAKE_LOCK,
             "YT3Hunter:Scan"
         );
@@ -582,7 +894,10 @@ public class ScanService extends Service {
 
     private void releaseWake(){
         try{
-            if(wakeLock!=null && wakeLock.isHeld()){
+            if(
+                wakeLock!=null &&
+                wakeLock.isHeld()
+            ){
                 wakeLock.release();
             }
         }catch(Exception ignored){}
@@ -590,105 +905,191 @@ public class ScanService extends Service {
 
     private void createChannel(){
         if(Build.VERSION.SDK_INT>=26){
-            NotificationChannel channel=new NotificationChannel(
-                CHANNEL,
-                "YT3 background scan",
-                NotificationManager.IMPORTANCE_LOW
+            NotificationChannel channel=
+                new NotificationChannel(
+                    CHANNEL,
+                    "YT3 background scan",
+                    NotificationManager.IMPORTANCE_LOW
+                );
+
+            channel.setDescription(
+                "Keeps the complete handle scan running in the background"
             );
 
-            channel.setDescription("Keeps the complete handle scan running in the background");
-
-            ((NotificationManager)getSystemService(NOTIFICATION_SERVICE))
-                .createNotificationChannel(channel);
+            ((NotificationManager)
+                getSystemService(
+                    NOTIFICATION_SERVICE
+                ))
+                .createNotificationChannel(
+                    channel
+                );
         }
     }
 
-    private Notification buildNotification(String override){
-        Intent open=new Intent(this,MainActivity.class);
+    private Notification buildNotification(
+        String override
+    ){
+        Intent open=
+            new Intent(
+                this,
+                MainActivity.class
+            );
 
-        PendingIntent content=PendingIntent.getActivity(
-            this,
-            1,
-            open,
-            PendingIntent.FLAG_UPDATE_CURRENT|PendingIntent.FLAG_IMMUTABLE
-        );
+        PendingIntent content=
+            PendingIntent.getActivity(
+                this,
+                1,
+                open,
+                PendingIntent.FLAG_UPDATE_CURRENT |
+                PendingIntent.FLAG_IMMUTABLE
+            );
 
-        String pauseAction=paused?ACTION_RESUME:ACTION_PAUSE;
+        String pauseAction=
+            paused
+                ? ACTION_RESUME
+                : ACTION_PAUSE;
 
-        PendingIntent pauseIntent=PendingIntent.getService(
-            this,
-            2,
-            new Intent(this,ScanService.class).setAction(pauseAction),
-            PendingIntent.FLAG_UPDATE_CURRENT|PendingIntent.FLAG_IMMUTABLE
-        );
+        PendingIntent pauseIntent=
+            PendingIntent.getService(
+                this,
+                2,
+                new Intent(
+                    this,
+                    ScanService.class
+                ).setAction(pauseAction),
+                PendingIntent.FLAG_UPDATE_CURRENT |
+                PendingIntent.FLAG_IMMUTABLE
+            );
 
-        PendingIntent stopIntent=PendingIntent.getService(
-            this,
-            3,
-            new Intent(this,ScanService.class).setAction(ACTION_STOP),
-            PendingIntent.FLAG_UPDATE_CURRENT|PendingIntent.FLAG_IMMUTABLE
-        );
+        PendingIntent stopIntent=
+            PendingIntent.getService(
+                this,
+                3,
+                new Intent(
+                    this,
+                    ScanService.class
+                ).setAction(ACTION_STOP),
+                PendingIntent.FLAG_UPDATE_CURRENT |
+                PendingIntent.FLAG_IMMUTABLE
+            );
 
-        int checked=prefs.getInt("checked",0);
-        int total=prefs.getInt("total",0);
-        int free=db==null?0:db.count(Db.FREE);
-        int unknown=db==null?0:db.count(Db.UNKNOWN);
+        int checked=
+            prefs.getInt("checked",0);
 
-        String text=override!=null
-            ? override
-            : checked+"/"+total+" • свободно "+free+" • сомнительно "+unknown;
+        int total=
+            prefs.getInt("total",0);
+
+        int free=
+            db==null
+                ? 0
+                : db.count(Db.FREE);
+
+        int unknown=
+            db==null
+                ? 0
+                : db.count(Db.UNKNOWN);
+
+        String text=
+            override!=null
+                ? override
+                : checked+
+                    "/"+
+                    total+
+                    " • свободно "+
+                    free+
+                    " • сомнительно "+
+                    unknown;
 
         Notification.Builder builder;
 
         if(Build.VERSION.SDK_INT>=26){
-            builder=new Notification.Builder(this,CHANNEL);
+            builder=
+                new Notification.Builder(
+                    this,
+                    CHANNEL
+                );
         }else{
-            builder=new Notification.Builder(this);
+            builder=
+                new Notification.Builder(this);
         }
 
         builder
             .setSmallIcon(R.drawable.ic_launcher)
-            .setContentTitle("YT3 Hunter — "+(paused?"пауза":"проверка идёт"))
+            .setContentTitle(
+                "YT3 Hunter — "+
+                (paused?"пауза":"проверка идёт")
+            )
             .setContentText(text)
             .setContentIntent(content)
             .setOngoing(scanning)
             .setOnlyAlertOnce(true)
-            .addAction(0,paused?"Продолжить":"Пауза",pauseIntent)
-            .addAction(0,"Стоп",stopIntent);
+            .addAction(
+                0,
+                paused
+                    ? "Продолжить"
+                    : "Пауза",
+                pauseIntent
+            )
+            .addAction(
+                0,
+                "Стоп",
+                stopIntent
+            );
 
         return builder.build();
     }
 
     private void updateNotification(String text){
         try{
-            ((NotificationManager)getSystemService(NOTIFICATION_SERVICE))
-                .notify(NOTIF_ID,buildNotification(text));
+            ((NotificationManager)
+                getSystemService(
+                    NOTIFICATION_SERVICE
+                ))
+                .notify(
+                    NOTIF_ID,
+                    buildNotification(text)
+                );
         }catch(Exception ignored){}
     }
 
     private void scheduleRestart(){
-        if(!prefs.getBoolean("scanning",false)) return;
+        if(!prefs.getBoolean("scanning",false)){
+            return;
+        }
 
-        Intent intent=new Intent(this,RestartReceiver.class)
-            .setAction("com.yt3hunter.app.RESTART_SCAN");
+        Intent intent=
+            new Intent(
+                this,
+                RestartReceiver.class
+            ).setAction(
+                "com.yt3hunter.app.RESTART_SCAN"
+            );
 
-        PendingIntent pi=PendingIntent.getBroadcast(
-            this,
-            44,
-            intent,
-            PendingIntent.FLAG_UPDATE_CURRENT|PendingIntent.FLAG_IMMUTABLE
-        );
+        PendingIntent pendingIntent=
+            PendingIntent.getBroadcast(
+                this,
+                44,
+                intent,
+                PendingIntent.FLAG_UPDATE_CURRENT |
+                PendingIntent.FLAG_IMMUTABLE
+            );
 
-        AlarmManager am=(AlarmManager)getSystemService(ALARM_SERVICE);
+        AlarmManager alarmManager=
+            (AlarmManager)
+                getSystemService(
+                    ALARM_SERVICE
+                );
 
-        am.setAndAllowWhileIdle(
+        alarmManager.setAndAllowWhileIdle(
             AlarmManager.ELAPSED_REALTIME_WAKEUP,
             SystemClock.elapsedRealtime()+5000,
-            pi
+            pendingIntent
         );
     }
 
-    @Override public void onTaskRemoved(Intent rootIntent){
+    @Override public void onTaskRemoved(
+        Intent rootIntent
+    ){
         scheduleRestart();
         super.onTaskRemoved(rootIntent);
     }
@@ -696,14 +1097,23 @@ public class ScanService extends Service {
     @Override public void onDestroy(){
         releaseWake();
 
-        if(prefs.getBoolean("scanning",false)){
+        if(
+            prefs.getBoolean(
+                "scanning",
+                false
+            )
+        ){
             scheduleRestart();
         }
+
+        netPool.shutdownNow();
 
         super.onDestroy();
     }
 
-    @Override public IBinder onBind(Intent intent){
+    @Override public IBinder onBind(
+        Intent intent
+    ){
         return null;
     }
 }

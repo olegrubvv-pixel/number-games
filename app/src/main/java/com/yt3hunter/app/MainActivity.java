@@ -10,6 +10,7 @@ import android.os.*;
 import android.provider.Settings;
 import android.view.*;
 import android.widget.*;
+
 import java.util.*;
 
 public class MainActivity extends Activity {
@@ -27,6 +28,7 @@ public class MainActivity extends Activity {
     private TextView current;
     private TextView status;
     private TextView speed;
+    private TextView sources;
 
     private final Handler handler=new Handler(Looper.getMainLooper());
     private Db db;
@@ -48,7 +50,8 @@ public class MainActivity extends Activity {
 
         if(
             Build.VERSION.SDK_INT>=33 &&
-            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)!=PackageManager.PERMISSION_GRANTED
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
+                !=PackageManager.PERMISSION_GRANTED
         ){
             requestPermissions(
                 new String[]{Manifest.permission.POST_NOTIFICATIONS},
@@ -80,7 +83,11 @@ public class MainActivity extends Activity {
         LinearLayout stats=column();
         stats.setBackgroundColor(PANEL);
         stats.setPadding(dp(14),dp(14),dp(14),dp(14));
-        root.addView(stats,new LinearLayout.LayoutParams(-1,-2));
+
+        root.addView(
+            stats,
+            new LinearLayout.LayoutParams(-1,-2)
+        );
 
         LinearLayout row1=row();
         LinearLayout row2=row();
@@ -97,11 +104,13 @@ public class MainActivity extends Activity {
 
         total=text("Всего в очереди: —",12,MUTED,false);
         speed=text("Скорость: 0.00/с",12,MUTED,false);
+        sources=text("Источники: ещё не проверены",12,MUTED,false);
         current=text("Сейчас: —",22,TEXT,true);
         status=text("Готов",12,Color.rgb(145,223,181),false);
 
         stats.addView(total);
         stats.addView(speed);
+        stats.addView(sources);
         stats.addView(space(5));
         stats.addView(current);
         stats.addView(space(4));
@@ -111,26 +120,55 @@ public class MainActivity extends Activity {
 
         LinearLayout buttons=row();
 
-        Button start=button("СТАРТ / ПРОДОЛЖИТЬ",ACCENT);
-        Button pause=button("ПАУЗА",Color.rgb(23,29,39));
-        Button stop=button("СТОП",Color.rgb(60,25,34));
+        Button start=button(
+            "СТАРТ / ПРОДОЛЖИТЬ",
+            ACCENT
+        );
+
+        Button pause=button(
+            "ПАУЗА",
+            Color.rgb(23,29,39)
+        );
+
+        Button stop=button(
+            "СТОП",
+            Color.rgb(60,25,34)
+        );
 
         buttons.addView(
             start,
-            new LinearLayout.LayoutParams(0,dp(50),1.5f)
+            new LinearLayout.LayoutParams(
+                0,
+                dp(50),
+                1.5f
+            )
         );
 
         buttons.addView(
             pause,
-            new LinearLayout.LayoutParams(0,dp(50),1f)
+            new LinearLayout.LayoutParams(
+                0,
+                dp(50),
+                1f
+            )
         );
 
         buttons.addView(
             stop,
-            new LinearLayout.LayoutParams(0,dp(50),1f)
+            new LinearLayout.LayoutParams(
+                0,
+                dp(50),
+                1f
+            )
         );
 
-        root.addView(buttons,new LinearLayout.LayoutParams(-1,-2));
+        root.addView(
+            buttons,
+            new LinearLayout.LayoutParams(
+                -1,
+                -2
+            )
+        );
 
         root.addView(space(8));
 
@@ -139,7 +177,13 @@ public class MainActivity extends Activity {
             Color.rgb(23,29,39)
         );
 
-        root.addView(battery,new LinearLayout.LayoutParams(-1,dp(50)));
+        root.addView(
+            battery,
+            new LinearLayout.LayoutParams(
+                -1,
+                dp(50)
+            )
+        );
 
         root.addView(space(8));
 
@@ -148,7 +192,13 @@ public class MainActivity extends Activity {
             Color.rgb(38,20,26)
         );
 
-        root.addView(reset,new LinearLayout.LayoutParams(-1,dp(50)));
+        root.addView(
+            reset,
+            new LinearLayout.LayoutParams(
+                -1,
+                dp(50)
+            )
+        );
 
         root.addView(space(16));
 
@@ -159,7 +209,13 @@ public class MainActivity extends Activity {
             true
         );
 
-        foundTitle.setPadding(0,dp(12),0,dp(12));
+        foundTitle.setPadding(
+            0,
+            dp(12),
+            0,
+            dp(12)
+        );
+
         root.addView(foundTitle);
 
         TextView unknownTitle=text(
@@ -169,49 +225,114 @@ public class MainActivity extends Activity {
             true
         );
 
-        unknownTitle.setPadding(0,dp(12),0,dp(12));
+        unknownTitle.setPadding(
+            0,
+            dp(12),
+            0,
+            dp(12)
+        );
+
         root.addView(unknownTitle);
 
         TextView note=text(
-            "После первого полного прохода приложение автоматически перепроверяет все сомнительные до тех пор, пока они не станут занятыми или свободными. Если Android принудительно нажать «Force stop» в настройках, система не позволит приложению перезапуститься до ручного открытия.",
+            "После первого полного прохода приложение автоматически перепроверяет все сомнительные до тех пор, пока они не станут занятыми или свободными. Если Android вручную сделать «Force stop» в настройках, система не позволит приложению перезапуститься до ручного открытия.",
             12,
             MUTED,
             false
         );
 
-        note.setPadding(0,dp(12),0,0);
+        note.setPadding(
+            0,
+            dp(12),
+            0,
+            0
+        );
+
         root.addView(note);
 
-        start.setOnClickListener(v->send(ScanService.ACTION_START));
+        start.setOnClickListener(
+            v->send(
+                ScanService.ACTION_START
+            )
+        );
 
-        pause.setOnClickListener(v->send(
-            prefs.getBoolean("paused",false)
-                ? ScanService.ACTION_RESUME
-                : ScanService.ACTION_PAUSE
-        ));
+        pause.setOnClickListener(
+            v->send(
+                prefs.getBoolean(
+                    "paused",
+                    false
+                )
+                    ? ScanService.ACTION_RESUME
+                    : ScanService.ACTION_PAUSE
+            )
+        );
 
-        stop.setOnClickListener(v->send(ScanService.ACTION_STOP));
-        battery.setOnClickListener(v->requestBatteryExemption());
+        stop.setOnClickListener(
+            v->send(
+                ScanService.ACTION_STOP
+            )
+        );
 
-        foundTitle.setOnClickListener(v->showRows(Db.FREE,"Свободные"));
-        unknownTitle.setOnClickListener(v->showRows(Db.UNKNOWN,"Сомнительные"));
-        unknown.setOnClickListener(v->showRows(Db.UNKNOWN,"Сомнительные"));
-        free.setOnClickListener(v->showRows(Db.FREE,"Свободные"));
+        battery.setOnClickListener(
+            v->requestBatteryExemption()
+        );
 
-        reset.setOnClickListener(v->
-            new AlertDialog.Builder(this)
-                .setTitle("Сбросить всё?")
-                .setMessage("Прогресс и найденные результаты будут удалены.")
-                .setNegativeButton("Отмена",null)
-                .setPositiveButton("Сбросить",(dialog,which)->resetAll())
-                .show()
+        foundTitle.setOnClickListener(
+            v->showRows(
+                Db.FREE,
+                "Свободные"
+            )
+        );
+
+        unknownTitle.setOnClickListener(
+            v->showRows(
+                Db.UNKNOWN,
+                "Сомнительные"
+            )
+        );
+
+        unknown.setOnClickListener(
+            v->showRows(
+                Db.UNKNOWN,
+                "Сомнительные"
+            )
+        );
+
+        free.setOnClickListener(
+            v->showRows(
+                Db.FREE,
+                "Свободные"
+            )
+        );
+
+        reset.setOnClickListener(
+            v->
+                new AlertDialog.Builder(this)
+                    .setTitle("Сбросить всё?")
+                    .setMessage(
+                        "Прогресс и найденные результаты будут удалены."
+                    )
+                    .setNegativeButton(
+                        "Отмена",
+                        null
+                    )
+                    .setPositiveButton(
+                        "Сбросить",
+                        (dialog,which)->
+                            resetAll()
+                    )
+                    .show()
         );
 
         return scroll;
     }
 
     private void send(String action){
-        Intent intent=new Intent(this,ScanService.class).setAction(action);
+        Intent intent=
+            new Intent(
+                this,
+                ScanService.class
+            ).setAction(action);
 
         try{
             if(Build.VERSION.SDK_INT>=26){
@@ -219,6 +340,7 @@ public class MainActivity extends Activity {
             }else{
                 startService(intent);
             }
+
         }catch(Exception e){
             Toast.makeText(
                 this,
@@ -229,13 +351,19 @@ public class MainActivity extends Activity {
     }
 
     private void requestBatteryExemption(){
-        if(Build.VERSION.SDK_INT<23) return;
+        if(Build.VERSION.SDK_INT<23){
+            return;
+        }
 
         try{
-            Intent intent=new Intent(
-                Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
-                Uri.parse("package:"+getPackageName())
-            );
+            Intent intent=
+                new Intent(
+                    Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                    Uri.parse(
+                        "package:"+
+                        getPackageName()
+                    )
+                );
 
             startActivity(intent);
 
@@ -263,20 +391,37 @@ public class MainActivity extends Activity {
         ).show();
     }
 
-    private void showRows(int type,String title){
+    private void showRows(
+        int type,
+        String title
+    ){
         new Thread(()->{
-            List<Db.Row> rows=db.rows(type,1000);
-            ArrayList<String> display=new ArrayList<>();
+            List<Db.Row> rows=
+                db.rows(
+                    type,
+                    1000
+                );
+
+            ArrayList<String> display=
+                new ArrayList<>();
 
             for(Db.Row row:rows){
-                String reason=row.reason==null?"":row.reason;
+                String reason=
+                    row.reason==null
+                        ? ""
+                        : row.reason;
 
                 display.add(
-                    "@"+row.handle+
-                    "\n"+reason+
-                    (type==Db.UNKNOWN
-                        ? "\nпопыток: "+row.attempts
-                        : "")
+                    "@"+
+                    row.handle+
+                    "\n"+
+                    reason+
+                    (
+                        type==Db.UNKNOWN
+                            ? "\nпопыток: "+
+                              row.attempts
+                            : ""
+                    )
                 );
             }
 
@@ -291,141 +436,317 @@ public class MainActivity extends Activity {
                     return;
                 }
 
-                AlertDialog dialog=new AlertDialog.Builder(this)
-                    .setTitle(
-                        title+
-                        " ("+
-                        display.size()+
-                        (rows.size()>=1000?"+":"")+
-                        ")"
-                    )
-                    .setItems(
-                        display.toArray(new String[0]),
-                        (d,which)->{
-                            String handle=rows.get(which).handle;
+                AlertDialog dialog=
+                    new AlertDialog.Builder(this)
+                        .setTitle(
+                            title+
+                            " ("+
+                            display.size()+
+                            (
+                                rows.size()>=1000
+                                    ? "+"
+                                    : ""
+                            )+
+                            ")"
+                        )
+                        .setItems(
+                            display.toArray(
+                                new String[0]
+                            ),
+                            (d,which)->{
+                                String handle=
+                                    rows.get(which)
+                                        .handle;
 
-                            Intent open=new Intent(
-                                Intent.ACTION_VIEW,
-                                Uri.parse(
-                                    "https://www.youtube.com/@"+handle
-                                )
-                            );
+                                Intent open=
+                                    new Intent(
+                                        Intent.ACTION_VIEW,
+                                        Uri.parse(
+                                            "https://www.youtube.com/@"+
+                                            handle
+                                        )
+                                    );
 
-                            startActivity(open);
-                        }
-                    )
-                    .setNegativeButton("Закрыть",null)
-                    .create();
+                                startActivity(open);
+                            }
+                        )
+                        .setNegativeButton(
+                            "Закрыть",
+                            null
+                        )
+                        .create();
 
                 dialog.show();
 
-                ListView list=dialog.getListView();
+                ListView list=
+                    dialog.getListView();
+
                 list.setBackgroundColor(PANEL);
                 list.setDividerHeight(1);
             });
+
         }).start();
     }
 
-    private final Runnable refresh=new Runnable(){
-        @Override public void run(){
-            int c=prefs.getInt("checked",0);
-            int t=prefs.getInt("taken",0);
-            int all=prefs.getInt("total",0);
+    private final Runnable refresh=
+        new Runnable(){
+            @Override public void run(){
+                int c=
+                    prefs.getInt(
+                        "checked",
+                        0
+                    );
 
-            checked.setText(String.valueOf(c));
-            taken.setText(String.valueOf(t));
+                int t=
+                    prefs.getInt(
+                        "taken",
+                        0
+                    );
 
-            int u=db.count(Db.UNKNOWN);
-            int f=db.count(Db.FREE);
+                int all=
+                    prefs.getInt(
+                        "total",
+                        0
+                    );
 
-            unknown.setText(String.valueOf(u));
-            free.setText(String.valueOf(f));
-
-            total.setText(
-                "Всего в очереди: "+
-                all+
-                " • осталось: "+
-                Math.max(0,all-c)
-            );
-
-            String nowHandle=prefs.getString("current","");
-
-            current.setText(
-                nowHandle.isEmpty()
-                    ? "Сейчас: —"
-                    : "Сейчас: @"+nowHandle
-            );
-
-            boolean running=prefs.getBoolean("scanning",false);
-            boolean paused=prefs.getBoolean("paused",false);
-            String phase=prefs.getString("phase","initial");
-
-            if(running){
-                status.setText(
-                    paused
-                        ? "Пауза"
-                        : (
-                            "retry".equals(phase)
-                                ? "Перепроверка сомнительных"
-                                : "Полное сканирование"
-                        )
+                checked.setText(
+                    String.valueOf(c)
                 );
-            }else{
-                status.setText(
-                    "done".equals(phase)
-                        ? "Готово полностью"
-                        : "Остановлено"
+
+                taken.setText(
+                    String.valueOf(t)
                 );
-            }
 
-            long now=System.currentTimeMillis();
+                int u=
+                    db.count(
+                        Db.UNKNOWN
+                    );
 
-            if(lastTick>0){
-                double perSecond=
-                    (c-lastChecked)/
-                    Math.max(.001,(now-lastTick)/1000.0);
+                int f=
+                    db.count(
+                        Db.FREE
+                    );
 
-                speed.setText(
-                    String.format(
-                        Locale.US,
-                        "Скорость: %.2f юз/с",
-                        Math.max(0,perSecond)
+                unknown.setText(
+                    String.valueOf(u)
+                );
+
+                free.setText(
+                    String.valueOf(f)
+                );
+
+                total.setText(
+                    "Всего в очереди: "+
+                    all+
+                    " • осталось: "+
+                    Math.max(
+                        0,
+                        all-c
                     )
                 );
+
+                int sourceCount=
+                    prefs.getInt(
+                        "source_count",
+                        0
+                    );
+
+                String sourceNames=
+                    prefs.getString(
+                        "sources",
+                        ""
+                    );
+
+                sources.setText(
+                    sourceCount==0
+                        ? "Источники: проверяются…"
+                        : "Источники: "+
+                          sourceCount+
+                          " • "+
+                          sourceNames
+                );
+
+                String nowHandle=
+                    prefs.getString(
+                        "current",
+                        ""
+                    );
+
+                current.setText(
+                    nowHandle.isEmpty()
+                        ? "Сейчас: —"
+                        : "Сейчас: @"+
+                          nowHandle
+                );
+
+                boolean running=
+                    prefs.getBoolean(
+                        "scanning",
+                        false
+                    );
+
+                boolean isPaused=
+                    prefs.getBoolean(
+                        "paused",
+                        false
+                    );
+
+                String phase=
+                    prefs.getString(
+                        "phase",
+                        "initial"
+                    );
+
+                if(running){
+                    if(isPaused){
+                        status.setText(
+                            "Пауза"
+                        );
+
+                    }else if(
+                        "health".equals(
+                            phase
+                        )
+                    ){
+                        status.setText(
+                            "Проверяю источники…"
+                        );
+
+                    }else if(
+                        "waiting_sources".equals(
+                            phase
+                        )
+                    ){
+                        status.setText(
+                            "Жду минимум 2 рабочих источника"
+                        );
+
+                    }else if(
+                        "retry".equals(
+                            phase
+                        )
+                    ){
+                        status.setText(
+                            "Перепроверка сомнительных"
+                        );
+
+                    }else{
+                        status.setText(
+                            "Полное сканирование"
+                        );
+                    }
+
+                }else{
+                    status.setText(
+                        "done".equals(
+                            phase
+                        )
+                            ? "Готово полностью"
+                            : "Остановлено"
+                    );
+                }
+
+                long now=
+                    System.currentTimeMillis();
+
+                if(lastTick>0){
+                    double perSecond=
+                        (c-lastChecked)/
+                        Math.max(
+                            .001,
+                            (now-lastTick)/1000.0
+                        );
+
+                    speed.setText(
+                        String.format(
+                            Locale.US,
+                            "Скорость: %.2f юз/с",
+                            Math.max(
+                                0,
+                                perSecond
+                            )
+                        )
+                    );
+                }
+
+                lastChecked=c;
+                lastTick=now;
+
+                handler.postDelayed(
+                    this,
+                    1000
+                );
             }
+        };
 
-            lastChecked=c;
-            lastTick=now;
-
-            handler.postDelayed(this,1000);
-        }
-    };
-
-    private TextView stat(LinearLayout parent,String label){
+    private TextView stat(
+        LinearLayout parent,
+        String label
+    ){
         LinearLayout box=column();
-        box.setPadding(dp(12),dp(11),dp(12),dp(11));
-        box.setBackgroundColor(Color.rgb(9,13,19));
 
-        box.addView(text(label,10,MUTED,false));
+        box.setPadding(
+            dp(12),
+            dp(11),
+            dp(12),
+            dp(11)
+        );
 
-        TextView value=text("0",24,TEXT,true);
+        box.setBackgroundColor(
+            Color.rgb(
+                9,
+                13,
+                19
+            )
+        );
+
+        box.addView(
+            text(
+                label,
+                10,
+                MUTED,
+                false
+            )
+        );
+
+        TextView value=
+            text(
+                "0",
+                24,
+                TEXT,
+                true
+            );
+
         box.addView(value);
 
-        LinearLayout.LayoutParams lp=
+        LinearLayout.LayoutParams params=
             new LinearLayout.LayoutParams(
                 0,
                 dp(82),
                 1f
             );
 
-        lp.setMargins(dp(4),0,dp(4),0);
-        parent.addView(box,lp);
+        params.setMargins(
+            dp(4),
+            0,
+            dp(4),
+            0
+        );
+
+        parent.addView(
+            box,
+            params
+        );
 
         return value;
     }
 
-    private Button button(String label,int color){
-        Button button=new Button(this);
+    private Button button(
+        String label,
+        int color
+    ){
+        Button button=
+            new Button(this);
 
         button.setText(label);
         button.setTextColor(TEXT);
@@ -442,48 +763,70 @@ public class MainActivity extends Activity {
         int color,
         boolean bold
     ){
-        TextView view=new TextView(this);
+        TextView view=
+            new TextView(this);
 
         view.setText(value);
         view.setTextSize(size);
         view.setTextColor(color);
 
         if(bold){
-            view.setTypeface(null,1);
+            view.setTypeface(
+                null,
+                1
+            );
         }
 
-        view.setLineSpacing(0,1.08f);
+        view.setLineSpacing(
+            0,
+            1.08f
+        );
 
         return view;
     }
 
     private LinearLayout column(){
-        LinearLayout layout=new LinearLayout(this);
-        layout.setOrientation(LinearLayout.VERTICAL);
+        LinearLayout layout=
+            new LinearLayout(this);
+
+        layout.setOrientation(
+            LinearLayout.VERTICAL
+        );
+
         return layout;
     }
 
     private LinearLayout row(){
-        LinearLayout layout=new LinearLayout(this);
-        layout.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout layout=
+            new LinearLayout(this);
+
+        layout.setOrientation(
+            LinearLayout.HORIZONTAL
+        );
+
         return layout;
     }
 
     private View space(int height){
-        Space space=new Space(this);
+        Space space=
+            new Space(this);
+
         space.setLayoutParams(
             new LinearLayout.LayoutParams(
                 1,
                 dp(height)
             )
         );
+
         return space;
     }
 
     private int dp(int value){
         return (int)(
             value*
-            getResources().getDisplayMetrics().density+
+            getResources()
+                .getDisplayMetrics()
+                .density+
             .5f
         );
     }
